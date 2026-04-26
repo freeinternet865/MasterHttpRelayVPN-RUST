@@ -55,6 +55,16 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(35);
 /// connect saves one Apps Script round-trip per new flow.
 const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 
+/// How long the muxer holds open the batch buffer after the first op
+/// arrives, waiting for more ops to coalesce. Issue #231 — the previous
+/// implementation drained `try_recv()` *immediately* after the first
+/// message landed, so under any non-bursty workload every batch held
+/// exactly one op (defeating the entire batching premise). 8 ms is small
+/// vs the ~2-7 s Apps Script round-trip the batch is amortizing, but
+/// long enough that concurrent HTTP/2 stream openings, parallel fetches,
+/// or any other burst lands in the same batch.
+const BATCH_COALESCE_WINDOW: Duration = Duration::from_millis(8);
+
 /// Structured error code the tunnel-node returns when it doesn't know the
 /// op (version mismatch). Must match `tunnel-node/src/main.rs`.
 const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
@@ -319,13 +329,29 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>) {
 
     loop {
         let mut msgs = Vec::new();
-        match tokio::time::timeout(Duration::from_millis(30), rx.recv()).await {
-            Ok(Some(msg)) => msgs.push(msg),
-            Ok(None) => break,
-            Err(_) => continue,
+        // Block on the first message — no point waking up to find an empty
+        // queue. Once the first op lands, we hold open BATCH_COALESCE_WINDOW
+        // so concurrent ops (parallel fetches, HTTP/2 stream openings, etc.)
+        // land in the same batch instead of getting a fresh round-trip each.
+        match rx.recv().await {
+            Some(msg) => msgs.push(msg),
+            None => break,
         }
-        while let Ok(msg) = rx.try_recv() {
-            msgs.push(msg);
+        let deadline = tokio::time::Instant::now() + BATCH_COALESCE_WINDOW;
+        loop {
+            // Drain anything that's already queued without waiting.
+            while let Ok(msg) = rx.try_recv() {
+                msgs.push(msg);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(deadline - now, rx.recv()).await {
+                Ok(Some(msg)) => msgs.push(msg),
+                Ok(None) => return,
+                Err(_) => break,
+            }
         }
 
         // Split: plain connects go parallel, data-bearing ops get batched.
