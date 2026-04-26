@@ -650,6 +650,113 @@ jobs:
           append_body: true
           generate_release_notes: true
 
+  # Refresh the in-repo `releases/` folder with the latest pre-built
+  # artifacts so users behind GitHub-Releases-page filtering (the IR
+  # state network filters the dynamic /releases/ URL but not the static
+  # `Code → Download ZIP` of the source tree) can still download.
+  # Practice was started pre-v1.1.0, dropped, then resumed at user
+  # request after a Telegram-channel suggestion: "فقط داخل پوشه ریلیز
+  # پروژه اپلود بکن — مشکل دانلود حل میشه — راحت میشه از گیتهاب دانلود
+  # کرد." The folder holds ONLY the latest version (replace, not
+  # archive); each tag refresh overwrites the previous artifacts. The
+  # existing release-page workflow keeps versioned artifacts behind
+  # `https://github.com/.../releases/tag/v...` for users who can reach
+  # that URL — this in-repo folder is the fallback for users who can't.
+  commit-releases:
+    needs: [build, android, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Always check out main, not the tag — we're committing back to
+      # the moving branch. fetch-depth 0 so `git push origin HEAD:main`
+      # has the lineage to fast-forward.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Refresh releases/ folder
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+
+          mkdir -p releases
+
+          # Wipe old binary artifacts (.apk, .tar.gz, .zip) but keep
+          # README.md and .gitattributes — those are folder-level docs
+          # that stay constant across versions and shouldn't be
+          # regenerated on every release.
+          find releases -maxdepth 1 -type f \
+            \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' \) \
+            -delete
+
+          # Copy desktop archives. Their names already include the
+          # platform identifier (mhrv-rs-linux-amd64.tar.gz, etc.) and
+          # are version-stable — no rename needed.
+          for f in artifacts/*.tar.gz artifacts/*.zip; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Android APKs come with the version baked into the name
+          # (mhrv-rs-android-universal-v1.7.5.apk). Copy all of them so
+          # users on slow connections can grab a per-ABI APK (~37 MB)
+          # instead of the universal (~110 MB).
+          for f in artifacts/mhrv-rs-android-*.apk; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Update the "Current version" line in releases/README.md
+          # (both English and Persian copies) and APK filename refs so
+          # the doc stays accurate. `sed -i` BSD/GNU compatibility is
+          # handled by passing an empty extension explicitly — runner
+          # is Linux so `-i` alone works, but the empty-string form
+          # also works on macOS for anyone running this locally.
+          if [ -f releases/README.md ]; then
+            sed -i.bak \
+              -e "s/Current version: \*\*v[0-9][0-9.]*\*\*/Current version: **v${VER}**/" \
+              -e "s/نسخهٔ فعلی: \*\*v[0-9][0-9.]*\*\*/نسخهٔ فعلی: **v${VER}**/" \
+              -e "s/mhrv-rs-android-universal-v[0-9][0-9.]*\.apk/mhrv-rs-android-universal-v${VER}.apk/g" \
+              releases/README.md
+            rm -f releases/README.md.bak
+          fi
+
+          echo "--- releases/ contents after refresh ---"
+          ls -la releases/
+
+      - name: Commit + push to main
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add releases
+          if git diff --cached --quiet; then
+            echo "No releases/ changes to commit (artifacts identical to current HEAD?)."
+            exit 0
+          fi
+
+          git commit -m "chore(releases): refresh prebuilt binaries for v${VER}" \
+                     -m "Auto-committed by release workflow so users behind GitHub-Releases-page filtering can download via the in-repo releases/ folder. The GitHub Release page itself still has the canonical versioned artifacts; this folder is the fallback path for users who can only reach the static source tree (Code → Download ZIP)."
+
+          # Push to main. The release workflow runs on the tag commit,
+          # which is reachable from main as a fast-forward — push is
+          # straightforward, no force needed. Tag protection rules
+          # apply to refs/tags/* not refs/heads/main, so this push
+          # isn't gated by the same protection.
+          git push origin HEAD:main
+
   # Notify the Persian-speaking Telegram channel with the CI-built
   # Android APK + its sha256 + the per-version changelog from
   # `docs/changelog/v<tag>.md`.
